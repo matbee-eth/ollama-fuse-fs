@@ -4,7 +4,7 @@ This application creates a simplified view of the Ollama model filesystem using 
 
 ## Overview
 
-Ollama stores models in a complex directory structure under `$HOME/.ollama`. This FUSE application crawls that structure and presents a simplified view where:
+Ollama stores models in a complex directory structure under `$HOME/.ollama` or any other specified directory. This FUSE application crawls these directories and presents a simplified view where:
 
 - Each model has its own directory at the root level
 - Inside each model directory, there are `.gguf` and `.modelfile` files for each version
@@ -53,17 +53,51 @@ make
 ## Usage
 
 ```bash
-./ollama-fuse <mount_point> [ollama_dir] [-f]
+./ollama-fuse <mount_point> [ollama_dir1] [ollama_dir2] ... [-f] [-d] [--llama-swap] [--base-url URL]
 ```
 
 Where:
 - `mount_point` is the directory where you want to mount the filesystem
-- `ollama_dir` (optional) is the path to your Ollama directory (defaults to `$OLLAMA_HOME` if set, otherwise `$HOME/.ollama`)
-- `-f` (optional) runs the filesystem in the foreground
+- `ollama_dir1`, `ollama_dir2`, etc. (optional) are paths to your Ollama directories (defaults to `$OLLAMA_HOME` if set, otherwise `$HOME/.ollama`)
+- `-f` (optional) run in foreground (by default, the process runs in the background)
+- `-d` (optional) enable debug output
+- `--llama-swap` or `-ls` (optional) generate a llama-swap configuration file
+- `--base-url URL` (optional) set the base URL for llama-swap proxy (default: http://0.0.0.0:11434)
+
+You can specify multiple Ollama directories, and the application will combine models from all of them into a single unified view.
 
 ### Environment Variables
 
 - `OLLAMA_HOME`: If set, this environment variable will be used as the default Ollama directory path when no path is specified on the command line
+
+## llama-swap Integration
+
+ollama-fuse can generate a configuration file for [llama-swap](https://github.com/mostlygeek/llama-swap), a transparent proxy server for llama.cpp that provides automatic model swapping. This allows you to use your Ollama models with llama.cpp server.
+
+To generate a llama-swap configuration file, use the `--llama-swap` or `-ls` option:
+
+```bash
+./ollama-fuse <mount_point> [ollama_dir1] [ollama_dir2] ... --llama-swap
+```
+
+This will create a `llama-swap-config.yaml` file in the current directory with all your Ollama models configured for use with llama-swap.
+
+You can customize the base URL for the proxy with the `--base-url` option:
+
+```bash
+./ollama-fuse <mount_point> [ollama_dir1] [ollama_dir2] ... --llama-swap --base-url http://127.0.0.1:8080
+```
+
+The generated configuration includes:
+- All discovered Ollama models
+- Appropriate paths to GGUF files
+- Default settings for healthCheckTimeout and logRequests
+
+After generating the configuration, you can use it with llama-swap:
+
+```bash
+llama-swap -config llama-swap-config.yaml
+```
 
 ### Example
 

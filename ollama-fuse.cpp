@@ -11,6 +11,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <fstream>
 #include <sstream>
@@ -19,6 +20,7 @@
 #include <chrono>
 #include <atomic>
 #include <mutex>
+#include <ctime>
 #include "json.hpp"
 
 // For path buffer sizes
@@ -45,9 +47,15 @@ struct ModelInfo {
 };
 
 // Global variables
-static std::string g_ollama_dir;
+static std::vector<std::string> g_ollama_dirs;
 static std::vector<ModelInfo> g_models;
 static std::map<std::string, std::string> g_file_mappings; // Maps virtual paths to real paths
+static bool g_debug_mode = false; // Debug mode flag
+static bool g_generate_llama_swap = false; // Flag to generate llama-swap config
+static std::string g_llama_swap_base_url = "http://0.0.0.0:11434"; // Default base URL for llama-swap
+
+// Forward declarations
+static bool discover_ollama_models();
 
 // Filesystem monitoring variables
 static std::atomic<bool> g_monitor_running(false);
@@ -81,6 +89,37 @@ static std::string read_file(const std::string& path) {
     return buffer.str();
 }
 
+// Function to add watches recursively to a directory and its subdirectories
+static void add_watches_recursive(const std::string& dir_path) {
+    DIR* dir = opendir(dir_path.c_str());
+    if (!dir) {
+        std::cerr << "Failed to open directory for watching: " << dir_path << ": " << strerror(errno) << std::endl;
+        return;
+    }
+    
+    // Add watch for this directory
+    int wd = inotify_add_watch(g_inotify_fd, dir_path.c_str(), 
+                             IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY);
+    if (wd == -1) {
+        std::cerr << "Failed to add watch for directory: " << dir_path << ": " << strerror(errno) << std::endl;
+    } else {
+        std::cout << "Added watch for directory: " << dir_path << std::endl;
+    }
+    
+    // Recursively add watches to subdirectories
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_type == DT_DIR && 
+            strcmp(entry->d_name, ".") != 0 && 
+            strcmp(entry->d_name, "..") != 0) {
+            std::string subdir_path = dir_path + "/" + entry->d_name;
+            add_watches_recursive(subdir_path);
+        }
+    }
+    
+    closedir(dir);
+}
+
 // Function to initialize inotify monitoring
 static bool init_filesystem_monitoring() {
     // Initialize inotify
@@ -90,12 +129,25 @@ static bool init_filesystem_monitoring() {
         return false;
     }
     
-    // Add watch for the manifests directory
-    std::string manifests_dir = g_ollama_dir + "/models/manifests";
-    g_watch_descriptor = inotify_add_watch(g_inotify_fd, manifests_dir.c_str(), 
-                                          IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY);
-    if (g_watch_descriptor == -1) {
-        std::cerr << "Failed to add watch for directory: " << manifests_dir << ": " << strerror(errno) << std::endl;
+    // Add watches for each Ollama directory
+    bool any_watch_added = false;
+    for (const auto& ollama_dir : g_ollama_dirs) {
+        // Add watches recursively for the manifests directory and its subdirectories
+        std::string manifests_dir = ollama_dir + "/models/manifests";
+        add_watches_recursive(manifests_dir);
+        
+        // Store the main watch descriptor for cleanup (using the last one for simplicity)
+        g_watch_descriptor = inotify_add_watch(g_inotify_fd, manifests_dir.c_str(), 
+                                             IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY);
+        if (g_watch_descriptor != -1) {
+            any_watch_added = true;
+        } else {
+            std::cerr << "Failed to add main watch for directory: " << manifests_dir << ": " << strerror(errno) << std::endl;
+        }
+    }
+    
+    if (!any_watch_added) {
+        std::cerr << "Failed to add watches for any Ollama directory" << std::endl;
         close(g_inotify_fd);
         g_inotify_fd = -1;
         return false;
@@ -166,8 +218,46 @@ static void monitor_filesystem_changes() {
             }
             
             if (changes_detected) {
-                std::cout << "Changes detected in Ollama models directory, refreshing..." << std::endl;
-                discover_ollama_models();
+                if (g_debug_mode) {
+                    std::cout << "Changes detected in Ollama models directory, refreshing..." << std::endl;
+                }
+                
+                // Save the current list of models for comparison
+                std::set<std::string> old_models;
+                {
+                    std::lock_guard<std::mutex> lock(g_models_mutex);
+                    for (const auto& model : g_models) {
+                        old_models.insert(model.name + ":" + model.version);
+                    }
+                }
+                
+                // Call discover_ollama_models to refresh the model list
+                // The function already has a mutex lock internally
+                if (!discover_ollama_models()) {
+                    std::cerr << "Failed to refresh Ollama models" << std::endl;
+                } else {
+                    // Compare old and new models to find new ones
+                    std::vector<std::string> new_models;
+                    {
+                        std::lock_guard<std::mutex> lock(g_models_mutex);
+                        for (const auto& model : g_models) {
+                            std::string model_key = model.name + ":" + model.version;
+                            if (old_models.find(model_key) == old_models.end()) {
+                                new_models.push_back(model_key);
+                            }
+                        }
+                    }
+                    
+                    std::cout << "Successfully refreshed Ollama models" << std::endl;
+                    
+                    // Print new models
+                    if (!new_models.empty()) {
+                        std::cout << "New models found:" << std::endl;
+                        for (const auto& model : new_models) {
+                            std::cout << "  " << model << std::endl;
+                        }
+                    }
+                }
             }
         }
     }
@@ -192,12 +282,16 @@ static bool discover_ollama_models() {
     g_models.clear();
     g_file_mappings.clear();
     
-    std::string manifests_dir = g_ollama_dir + "/models/manifests";
-    DIR* dir = opendir(manifests_dir.c_str());
-    if (!dir) {
-        std::cerr << "Failed to open Ollama manifests directory: " << manifests_dir << std::endl;
-        return false;
-    }
+    bool any_models_found = false;
+    
+    // Process each Ollama directory
+    for (const auto& ollama_dir : g_ollama_dirs) {
+        std::string manifests_dir = ollama_dir + "/models/manifests";
+        DIR* dir = opendir(manifests_dir.c_str());
+        if (!dir) {
+            std::cerr << "Failed to open Ollama manifests directory: " << manifests_dir << std::endl;
+            continue; // Try the next directory
+        }
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
@@ -264,7 +358,15 @@ static bool discover_ollama_models() {
                                         if (digest_filename.find("sha256:") == 0) {
                                             digest_filename = "sha256-" + digest_filename.substr(7);
                                         }
-                                        model.gguf_path = g_ollama_dir + "/models/blobs/" + digest_filename;
+                                        // Try to find the GGUF file in any of the Ollama directories
+                                        for (const auto& ollama_dir : g_ollama_dirs) {
+                                            std::string potential_path = ollama_dir + "/models/blobs/" + digest_filename;
+                                            struct stat st;
+                                            if (stat(potential_path.c_str(), &st) == 0) {
+                                                model.gguf_path = potential_path;
+                                                break;
+                                            }
+                                        }
                                         
                                         // Check if the file exists
                                         struct stat st;
@@ -300,7 +402,16 @@ static bool discover_ollama_models() {
                             if (config_filename.find("sha256:") == 0) {
                                 config_filename = "sha256-" + config_filename.substr(7);
                             }
-                            std::string config_path = g_ollama_dir + "/models/blobs/" + config_filename;
+                            // Try to find the config file in any of the Ollama directories
+                            std::string config_path;
+                            for (const auto& ollama_dir : g_ollama_dirs) {
+                                std::string potential_path = ollama_dir + "/models/blobs/" + config_filename;
+                                struct stat st;
+                                if (stat(potential_path.c_str(), &st) == 0) {
+                                    config_path = potential_path;
+                                    break;
+                                }
+                            }
                             std::string config_content = read_file(config_path);
                             
                             if (!config_content.empty()) {
@@ -329,7 +440,16 @@ static bool discover_ollama_models() {
                                     if (digest_filename.find("sha256:") == 0) {
                                         digest_filename = "sha256-" + digest_filename.substr(7);
                                     }
-                                    std::string blob_path = g_ollama_dir + "/models/blobs/" + digest_filename;
+                                    // Try to find the blob file in any of the Ollama directories
+                                    std::string blob_path;
+                                    for (const auto& ollama_dir : g_ollama_dirs) {
+                                        std::string potential_path = ollama_dir + "/models/blobs/" + digest_filename;
+                                        struct stat st;
+                                        if (stat(potential_path.c_str(), &st) == 0) {
+                                            blob_path = potential_path;
+                                            break;
+                                        }
+                                    }
                                     
                                     if (media_type == "application/vnd.ollama.image.template") {
                                         std::string template_content = read_file(blob_path);
@@ -341,13 +461,29 @@ static bool discover_ollama_models() {
                                         if (!params_content.empty()) {
                                             try {
                                                 json params_json = json::parse(params_content);
-                                                if (params_json.contains("stop") && params_json["stop"].is_array()) {
-                                                    modelfile_content += "PARAMETER stop \"";
-                                                    for (size_t i = 0; i < params_json["stop"].size(); ++i) {
-                                                        if (i > 0) modelfile_content += ",";
-                                                        modelfile_content += params_json["stop"][i].get<std::string>();
+                                                // Iterate through all parameters in the JSON
+                                                for (auto& [param_name, param_value] : params_json.items()) {
+                                                    if (param_value.is_array()) {
+                                                        // For array parameters, add each value as a separate parameter
+                                                        for (size_t i = 0; i < param_value.size(); ++i) {
+                                                            if (param_value[i].is_string()) {
+                                                                modelfile_content += "PARAMETER " + param_name + " \"" + param_value[i].get<std::string>() + "\"\n";
+                                                            } else if (param_value[i].is_number()) {
+                                                                modelfile_content += "PARAMETER " + param_name + " " + param_value[i].dump() + "\n";
+                                                            } else if (param_value[i].is_boolean()) {
+                                                                modelfile_content += "PARAMETER " + param_name + " " + (param_value[i].get<bool>() ? "true" : "false") + "\n";
+                                                            }
+                                                        }
+                                                    } else if (param_value.is_string()) {
+                                                        // For string parameters
+                                                        modelfile_content += "PARAMETER " + param_name + " \"" + param_value.get<std::string>() + "\"\n";
+                                                    } else if (param_value.is_number()) {
+                                                        // For numeric parameters
+                                                        modelfile_content += "PARAMETER " + param_name + " " + param_value.dump() + "\n";
+                                                    } else if (param_value.is_boolean()) {
+                                                        // For boolean parameters
+                                                        modelfile_content += "PARAMETER " + param_name + " " + (param_value.get<bool>() ? "true" : "false") + "\n";
                                                     }
-                                                    modelfile_content += "\"\n";
                                                 }
                                             } catch (const std::exception& e) {
                                                 std::cerr << "Error parsing parameters file: " << e.what() << std::endl;
@@ -391,17 +527,22 @@ static bool discover_ollama_models() {
         }
         closedir(reg_dir);
     }
-    closedir(dir);
+        closedir(dir);
+        any_models_found = true;
+    }
 
     std::cout << "Discovered " << g_models.size() << " Ollama models" << std::endl;
-    for (const auto& model : g_models) {
-        std::cout << "Model: " << model.name << ", Version: " << model.version << std::endl;
-    }
     
-    // Print file mappings for debugging
-    std::cout << "\nFile mappings:" << std::endl;
-    for (const auto& mapping : g_file_mappings) {
-        std::cout << "Virtual path: " << mapping.first << " -> Real path: " << mapping.second << std::endl;
+    if (g_debug_mode) {
+        for (const auto& model : g_models) {
+            std::cout << "Model: " << model.name << ", Version: " << model.version << std::endl;
+        }
+        
+        // Print file mappings for debugging
+        std::cout << "\nFile mappings:" << std::endl;
+        for (const auto& mapping : g_file_mappings) {
+            std::cout << "Virtual path: " << mapping.first << " -> Real path: " << mapping.second << std::endl;
+        }
     }
 
     return !g_models.empty();
@@ -455,6 +596,9 @@ static int ollama_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
     (void)fi;
     (void)flags;
 
+    // Lock the mutex to ensure thread safety
+    std::lock_guard<std::mutex> lock(g_models_mutex);
+
     filler(buf, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
     filler(buf, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
 
@@ -495,6 +639,9 @@ static int ollama_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
 }
 
 static int ollama_open(const char* path, struct fuse_file_info* fi) {
+    // Lock the mutex to ensure thread safety
+    std::lock_guard<std::mutex> lock(g_models_mutex);
+    
     if (g_file_mappings.find(path) == g_file_mappings.end()) {
         return -ENOENT;
     }
@@ -509,6 +656,9 @@ static int ollama_open(const char* path, struct fuse_file_info* fi) {
 
 static int ollama_read(const char* path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi) {
     (void)fi;
+    
+    // Lock the mutex to ensure thread safety
+    std::lock_guard<std::mutex> lock(g_models_mutex);
     
     if (g_file_mappings.find(path) == g_file_mappings.end()) {
         return -ENOENT;
@@ -574,16 +724,86 @@ static const struct fuse_operations ollama_oper = {
     /* copy_file_range */ nullptr,
 };
 
+// Function to generate llama-swap config.yaml
+static void generate_llama_swap_config(const std::string& output_path) {
+    std::ofstream config_file(output_path);
+    if (!config_file.is_open()) {
+        std::cerr << "Error: Could not open file for writing: " << output_path << std::endl;
+        return;
+    }
+    
+    // Write header
+    config_file << "# llama-swap configuration generated by ollama-fuse\n";
+    config_file << "# Generated on " << std::time(nullptr) << "\n\n";
+    
+    // Write default settings
+    config_file << "# Seconds to wait for llama.cpp to load and be ready to serve requests\n";
+    config_file << "healthCheckTimeout: 60\n\n";
+    
+    config_file << "# Write HTTP logs (useful for troubleshooting)\n";
+    config_file << "logRequests: true\n\n";
+    
+    // Write models section
+    config_file << "# Define valid model values and the upstream server start\n";
+    config_file << "models:\n";
+    
+    // Add each model
+    std::lock_guard<std::mutex> lock(g_models_mutex);
+    for (const auto& model : g_models) {
+        std::string model_key = model.name;
+        if (!model.version.empty() && model.version != "latest") {
+            model_key += "-" + model.version;
+        }
+        
+        config_file << "  \"" << model_key << "\":\n";
+        
+        // Find the GGUF file path
+        std::string gguf_path;
+        for (const auto& mapping : g_file_mappings) {
+            if (mapping.first.find("/" + model.name + "/" + model.version + ".gguf") != std::string::npos) {
+                gguf_path = mapping.second;
+                break;
+            }
+        }
+        
+        // Add proxy
+        config_file << "    proxy: \"" << g_llama_swap_base_url << "\"\n";
+        
+        // Add command
+        config_file << "    cmd: >\n";
+        config_file << "      /app/llama-server\n";
+        
+        if (!gguf_path.empty()) {
+            config_file << "      -m " << gguf_path << "\n";
+        } else {
+            // If we can't find the exact GGUF file, use the model name/version
+            config_file << "      -m " << model.name << "/" << model.version << "\n";
+        }
+        
+        // Add port (using a unique port for each model)
+        config_file << "      --port 9999\n";
+        config_file << "\n";
+    }
+    
+    config_file.close();
+    std::cout << "Generated llama-swap config at: " << output_path << std::endl;
+}
+
 int main(int argc, char* argv[]) {
     // Check command line arguments
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <mountpoint> [ollama_path]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <mountpoint> [ollama_path1] [ollama_path2] ..." << std::endl;
         std::cerr << "Options:" << std::endl;
         std::cerr << "  ollama_path    Path to Ollama directory (default: $OLLAMA_HOME or $HOME/.ollama)" << std::endl;
-        std::cerr << "  -f             Run in foreground (default)" << std::endl;
+        std::cerr << "                 Multiple Ollama directories can be specified" << std::endl;
+        std::cerr << "  -f             Run in foreground" << std::endl;
+        std::cerr << "  -d             Enable debug output" << std::endl;
+        std::cerr << "  --llama-swap   Generate llama-swap config.yaml" << std::endl;
+        std::cerr << "  -ls            Short for --llama-swap" << std::endl;
+        std::cerr << "  --base-url URL Base URL for llama-swap proxy (default: http://0.0.0.0:11434)" << std::endl;
         std::cerr << "  -o opt,[opt]   FUSE mount options" << std::endl;
         std::cerr << "\nEnvironment Variables:" << std::endl;
-        std::cerr << "  OLLAMA_HOME    Path to Ollama directory (used if ollama_path not specified)" << std::endl;
+        std::cerr << "  OLLAMA_HOME    Path to Ollama directory (used if no ollama_path specified)" << std::endl;
         return 1;
     }
     
@@ -593,35 +813,66 @@ int main(int argc, char* argv[]) {
     fuse_args.push_back(argv[1]);  // Mount point
     
     // Process our own arguments
-    std::string ollama_dir = DEFAULT_OLLAMA_DIR;
-    bool ollama_dir_set = false;
+    std::vector<std::string> ollama_dirs;
     
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "-f") == 0 || 
-            strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "-s") == 0) {
+        if (strcmp(argv[i], "-o") == 0) {
             // Pass through FUSE options
             fuse_args.push_back(argv[i]);
-            if (i + 1 < argc && strcmp(argv[i], "-o") == 0) {
+            if (i + 1 < argc) {
                 fuse_args.push_back(argv[i+1]);
                 i++;
             }
+        } else if (strcmp(argv[i], "-f") == 0) {
+            // Foreground mode
+            fuse_args.push_back(argv[i]);
+        } else if (strcmp(argv[i], "-d") == 0) {
+            // Debug mode
+            g_debug_mode = true;
+            // Also pass -d to FUSE for its debug output
+            fuse_args.push_back(argv[i]);
+        } else if (strcmp(argv[i], "-s") == 0) {
+            // Single-threaded mode
+            fuse_args.push_back(argv[i]);
+        } else if (strcmp(argv[i], "--llama-swap") == 0 || strcmp(argv[i], "-ls") == 0) {
+            // Generate llama-swap config
+            g_generate_llama_swap = true;
+        } else if (strcmp(argv[i], "--base-url") == 0) {
+            // Set base URL for llama-swap
+            if (i + 1 < argc) {
+                g_llama_swap_base_url = argv[i+1];
+                i++;
+            } else {
+                std::cerr << "Error: --base-url requires an argument" << std::endl;
+                return 1;
+            }
         } else if (strncmp(argv[i], "--ollama-dir=", 13) == 0) {
             // Parse ollama directory from --ollama-dir option
-            ollama_dir = argv[i] + 13;
-            ollama_dir_set = true;
-        } else if (!ollama_dir_set && argv[i][0] != '-') {
-            // If it's not an option and ollama_dir is not set yet, assume it's the ollama path
-            ollama_dir = argv[i];
-            ollama_dir_set = true;
+            ollama_dirs.push_back(argv[i] + 13);
+        } else if (argv[i][0] != '-') {
+            // If it's not an option, assume it's an ollama path
+            ollama_dirs.push_back(argv[i]);
         } else {
             // Unknown option, assume it's for FUSE
             fuse_args.push_back(argv[i]);
         }
     }
     
-    // Set Ollama directory
-    g_ollama_dir = ollama_dir;
-    std::cout << "Using Ollama directory: " << g_ollama_dir << std::endl;
+    // If no Ollama directories were specified, use the default
+    if (ollama_dirs.empty()) {
+        ollama_dirs.push_back(DEFAULT_OLLAMA_DIR);
+    }
+    
+    // Set Ollama directories
+    g_ollama_dirs = ollama_dirs;
+    if (g_debug_mode) {
+        std::cout << "Using Ollama directories:" << std::endl;
+        for (const auto& dir : g_ollama_dirs) {
+            std::cout << "  " << dir << std::endl;
+        }
+    } else {
+        std::cout << "Using " << g_ollama_dirs.size() << " Ollama director" << (g_ollama_dirs.size() == 1 ? "y" : "ies") << std::endl;
+    }
     
     // Discover Ollama models
     if (!discover_ollama_models()) {
@@ -641,9 +892,7 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    if (!has_foreground) {
-        fuse_args.push_back(strdup("-f"));  // Foreground
-    }
+    // We don't add -f by default anymore, as we want to run in background
     
     if (!has_options) {
         fuse_args.push_back(strdup("-o"));
@@ -652,6 +901,16 @@ int main(int argc, char* argv[]) {
     
     // Start filesystem monitoring
     start_filesystem_monitoring();
+    
+    if (g_debug_mode) {
+        std::cout << "Filesystem monitoring started" << std::endl;
+    }
+    
+    // Generate llama-swap config if requested
+    if (g_generate_llama_swap) {
+        std::string config_path = "llama-swap-config.yaml";
+        generate_llama_swap_config(config_path);
+    }
     
     // Run FUSE
     int result = fuse_main(fuse_args.size(), fuse_args.data(), &ollama_oper, nullptr);
