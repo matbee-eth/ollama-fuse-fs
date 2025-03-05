@@ -19,6 +19,11 @@
 #include <cerrno>
 #include "json.hpp"
 
+// Windows-specific includes for resource extraction
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 using json = nlohmann::json;
 
 // Global variables
@@ -1006,23 +1011,108 @@ extern "C" int fuse_main_real(int argc, char *argv[],
     fuse_main_real(argc, argv, ops, sizeof *(ops), data)
 #endif
 
+#ifdef EMBED_WINFSP_DLLS
+// Function to extract embedded DLLs
+static bool extract_embedded_dlls() {
+    #ifdef _WIN32
+    // Get the temporary directory path
+    char temp_path[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, temp_path) == 0) {
+        std::cerr << "Failed to get temporary directory path" << std::endl;
+        return false;
+    }
+    
+    // Create a subdirectory for our DLLs
+    std::string dll_dir = std::string(temp_path) + "ollama-fuse-dlls";
+    CreateDirectoryA(dll_dir.c_str(), NULL);
+    
+    // Extract the platform-specific DLL
+    HRSRC platform_dll_res = FindResourceA(NULL, "WINFSP_PLATFORM_DLL", "RCDATA");
+    if (platform_dll_res) {
+        HGLOBAL platform_dll_handle = LoadResource(NULL, platform_dll_res);
+        if (platform_dll_handle) {
+            DWORD platform_dll_size = SizeofResource(NULL, platform_dll_res);
+            void* platform_dll_data = LockResource(platform_dll_handle);
+            
+            if (platform_dll_data) {
+                std::string platform_dll_path = dll_dir + "\\winfsp-platform.dll";
+                std::ofstream platform_dll_file(platform_dll_path, std::ios::binary);
+                platform_dll_file.write(static_cast<const char*>(platform_dll_data), platform_dll_size);
+                platform_dll_file.close();
+                
+                // Load the DLL
+                if (LoadLibraryA(platform_dll_path.c_str()) == NULL) {
+                    std::cerr << "Failed to load platform DLL: " << GetLastError() << std::endl;
+                    return false;
+                }
+            }
+        }
+    } else {
+        std::cerr << "Failed to find platform DLL resource: " << GetLastError() << std::endl;
+        return false;
+    }
+    
+    // Extract the MSIL DLL
+    HRSRC msil_dll_res = FindResourceA(NULL, "WINFSP_MSIL_DLL", "RCDATA");
+    if (msil_dll_res) {
+        HGLOBAL msil_dll_handle = LoadResource(NULL, msil_dll_res);
+        if (msil_dll_handle) {
+            DWORD msil_dll_size = SizeofResource(NULL, msil_dll_res);
+            void* msil_dll_data = LockResource(msil_dll_handle);
+            
+            if (msil_dll_data) {
+                std::string msil_dll_path = dll_dir + "\\winfsp-msil.dll";
+                std::ofstream msil_dll_file(msil_dll_path, std::ios::binary);
+                msil_dll_file.write(static_cast<const char*>(msil_dll_data), msil_dll_size);
+                msil_dll_file.close();
+                
+                // Load the DLL
+                if (LoadLibraryA(msil_dll_path.c_str()) == NULL) {
+                    std::cerr << "Failed to load MSIL DLL: " << GetLastError() << std::endl;
+                    return false;
+                }
+            }
+        }
+    } else {
+        std::cerr << "Failed to find MSIL DLL resource: " << GetLastError() << std::endl;
+        return false;
+    }
+    
+    return true;
+    #else
+    return false;
+    #endif
+}
+#endif
+
 int main(int argc, char* argv[]) {
-    // Check command line arguments
+    // Check if we have enough arguments
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <mountpoint> [ollama_path1] [ollama_path2] ..." << std::endl;
-        std::cerr << "Options:" << std::endl;
-        std::cerr << "  ollama_path    Path to Ollama directory (default: $OLLAMA_HOME or $HOME/.ollama)" << std::endl;
-        std::cerr << "                 Multiple Ollama directories can be specified" << std::endl;
-        std::cerr << "  -f             Run in foreground" << std::endl;
-        std::cerr << "  -d             Enable debug output" << std::endl;
-        std::cerr << "  --llama-swap   Generate llama-swap config.yaml" << std::endl;
-        std::cerr << "  -ls            Short for --llama-swap" << std::endl;
-        std::cerr << "  --base-url URL Base URL for llama-swap proxy (default: http://0.0.0.0:11434)" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <mount_point> [ollama_path] [options]" << std::endl;
+        std::cerr << "\nOptions:" << std::endl;
+        std::cerr << "  --ollama-dir=<path>  Path to Ollama directory (can be specified multiple times)" << std::endl;
+        std::cerr << "  -f                   Run in foreground (don't fork)" << std::endl;
+        std::cerr << "  -d                   Enable debug output" << std::endl;
+        std::cerr << "  -s                   Run single-threaded" << std::endl;
+        std::cerr << "  --llama-swap, -ls    Generate llama-swap config" << std::endl;
+        std::cerr << "  --base-url <url>     Base URL for llama-swap (default: http://localhost:11434)" << std::endl;
         std::cerr << "  -o opt,[opt]   FUSE mount options" << std::endl;
         std::cerr << "\nEnvironment Variables:" << std::endl;
         std::cerr << "  OLLAMA_HOME    Path to Ollama directory (used if no ollama_path specified)" << std::endl;
         return 1;
     }
+    
+#ifdef EMBED_WINFSP_DLLS
+    // Extract and load embedded DLLs
+    if (!extract_embedded_dlls()) {
+        std::cerr << "Failed to extract embedded WinFSP DLLs" << std::endl;
+        return 1;
+    }
+    
+    if (g_debug_mode) {
+        std::cout << "Successfully extracted and loaded WinFSP DLLs" << std::endl;
+    }
+#endif
     
     // Prepare FUSE arguments
     std::vector<char*> fuse_args;
@@ -1108,8 +1198,6 @@ int main(int argc, char* argv[]) {
             has_options = true;
         }
     }
-    
-    // We don't add -f by default anymore, as we want to run in background
     
     if (!has_options) {
         fuse_args.push_back(strdup("-o"));
